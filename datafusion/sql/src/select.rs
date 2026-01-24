@@ -110,11 +110,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         )?;
 
         // Having and group by clause may reference aliases defined in select projection
-        let projected_plan = self.project(base_plan.clone(), select_exprs)?;
-        let select_exprs = projected_plan.expressions();
+        let projected_plan = self.project(base_plan.clone(), select_exprs.clone())?;
 
+        let projected_plan_exprs = projected_plan.expressions();
         let order_by =
-            to_order_by_exprs_with_select(query_order_by, Some(&select_exprs))?;
+            to_order_by_exprs_with_select(query_order_by, Some(&projected_plan_exprs))?;
 
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
@@ -131,62 +131,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             true,
             Some(base_plan.schema().as_ref()),
         )?;
-        let order_by_rex = normalize_sorts(order_by_rex, &projected_plan)?;
+        let mut order_by_rex = normalize_sorts(order_by_rex, &projected_plan)?;
+
+        // Convert SelectExpr to Expr for add_missing_order_by_exprs
+        let mut projected_select_exprs: Vec<Expr> = select_exprs
+            .iter()
+            .filter_map(|e| match e {
+                SelectExpr::Expression(expr) => Some(expr.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let added = Self::add_missing_order_by_exprs(
+            &mut projected_select_exprs,
+            projected_plan.schema(),
+            matches!(select.distinct, Some(Distinct::Distinct)),
+            &mut order_by_rex,
+        )?;
 
         // This alias map is resolved and looked up in both having exprs and group by exprs
-        let alias_map = extract_aliases(&select_exprs);
-
-        // Check if ORDER BY references any columns not in the SELECT list
-        // If DISTINCT is used, we need to verify this is acceptable
-        // This is similar to how HAVING is handled
-        let select_exprs = if select.distinct.is_some() && !order_by_rex.is_empty() {
-            let mut missing_order_by_exprs = Vec::new();
-            let mut missing_cols = HashSet::new();
-
-            for sort_expr in &order_by_rex {
-                let order_by_expr = &sort_expr.expr;
-
-                // Extract columns referenced in the ORDER BY expression
-                let mut order_by_cols = HashSet::new();
-                if expr_to_columns(order_by_expr, &mut order_by_cols).is_ok() {
-                    for col in order_by_cols {
-                        // Check if this column is in the projected schema
-                        if !projected_plan.schema().has_column(&col) {
-                            // This column is not in the current projection
-                            // Check if we can resolve it from the base_plan schema
-                            if base_plan.schema().has_column(&col) {
-                                missing_cols.insert(col.clone());
-                                if !missing_order_by_exprs
-                                    .iter()
-                                    .any(|e: &Expr| e == order_by_expr)
-                                {
-                                    missing_order_by_exprs.push(order_by_expr.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If there are missing columns and DISTINCT is used, perform the ambiguous distinct check
-            if !missing_order_by_exprs.is_empty() {
-                // Perform the ambiguous distinct check - if it fails, we should return the error
-                // immediately, not add the columns to the select list
-                Self::ambiguous_distinct_check(
-                    &missing_order_by_exprs,
-                    &missing_cols,
-                    &select_exprs,
-                )?;
-                // If we get here, the check passed (expressions are aliases or already in select list)
-                // so we should NOT add them again
-                select_exprs.to_vec()
-            } else {
-                select_exprs.to_vec()
-            }
-        } else {
-            select_exprs.to_vec()
-        };
-
+        let alias_map = extract_aliases(&projected_select_exprs);
         // Optionally the HAVING expression.
         let having_expr_opt = select
             .having
@@ -232,8 +196,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
                     let group_by_expr =
                         resolve_aliases_to_exprs(group_by_expr, &alias_map)?;
-                    let group_by_expr =
-                        resolve_positions_to_exprs(group_by_expr, &select_exprs)?;
+                    let group_by_expr = resolve_positions_to_exprs(
+                        group_by_expr,
+                        &projected_select_exprs,
+                    )?;
                     let group_by_expr = normalize_col(group_by_expr, &projected_plan)?;
                     self.validate_schema_satisfies_exprs(
                         base_plan.schema(),
@@ -245,7 +211,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         } else {
             // 'group by all' groups wrt. all select expressions except 'AggregateFunction's.
             // Filter and collect non-aggregate select expressions
-            select_exprs
+            projected_select_exprs
                 .iter()
                 .filter(|select_expr| match select_expr {
                     Expr::AggregateFunction(_) => false,
@@ -288,7 +254,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // The outer expressions we will search through for aggregates.
         // First, find aggregates in SELECT, HAVING, and QUALIFY
         let select_having_qualify_aggrs = find_aggregate_exprs(
-            select_exprs
+            projected_select_exprs
                 .iter()
                 .chain(having_expr_opt.iter())
                 .chain(qualify_expr_opt.iter()),
@@ -316,7 +282,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         } = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
             self.aggregate(
                 &base_plan,
-                &select_exprs,
+                projected_select_exprs.as_slice(),
                 having_expr_opt.as_ref(),
                 qualify_expr_opt.as_ref(),
                 &order_by_rex,
@@ -332,7 +298,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
                 None => AggregatePlanResult {
                     plan: base_plan.clone(),
-                    select_exprs: select_exprs.clone(),
+                    select_exprs: projected_select_exprs.clone(),
                     having_expr: having_expr_opt,
                     qualify_expr: qualify_expr_opt,
                     order_by_exprs: order_by_rex,
@@ -434,7 +400,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
                 // Build the final plan
                 LogicalPlanBuilder::from(base_plan)
-                    .distinct_on(on_expr, select_exprs, None)?
+                    .distinct_on(on_expr, projected_select_exprs.clone(), None)?
                     .build()
             }
         }?;
@@ -460,57 +426,20 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         let plan = self.order_by(plan, order_by_rex)?;
-        Ok(plan)
-    }
-
-    /// Check if ORDER BY expressions with DISTINCT are ambiguous
-    ///
-    /// This function verifies that ORDER BY expressions only reference
-    /// columns that are either:
-    /// 1. Already in the SELECT list, or
-    /// 2. Aliases for expressions in the SELECT list
-    ///
-    /// If neither condition is met, it returns an error since this would
-    /// make the DISTINCT operation ambiguous.
-    fn ambiguous_distinct_check(
-        missing_exprs: &[Expr],
-        missing_cols: &HashSet<Column>,
-        projection_exprs: &[Expr],
-    ) -> Result<()> {
-        if missing_exprs.is_empty() {
-            return Ok(());
+        // if add missing columns, we MUST remove unused columns in project
+        if added {
+            LogicalPlanBuilder::from(plan)
+                .project(
+                    projected_plan
+                        .schema()
+                        .columns()
+                        .into_iter()
+                        .map(Expr::Column),
+                )?
+                .build()
+        } else {
+            Ok(plan)
         }
-
-        // If the missing columns are all only aliases for things in
-        // the existing select list, it is ok
-        //
-        // This handles the special case for:
-        // SELECT col as <alias> ORDER BY <alias>
-        //
-        // As described in https://github.com/apache/datafusion/issues/5293
-        let all_aliases = missing_exprs.iter().all(|e| {
-            projection_exprs.iter().any(|proj_expr| {
-                if let Expr::Alias(Alias { expr, .. }) = proj_expr {
-                    e == expr.as_ref()
-                } else {
-                    false
-                }
-            })
-        });
-        if all_aliases {
-            return Ok(());
-        }
-
-        let missing_col_names = missing_cols
-            .iter()
-            .map(|col| col.flat_name())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        plan_err!(
-            "For SELECT DISTINCT, ORDER BY expressions {} must appear in select list",
-            missing_col_names
-        )
     }
 
     /// Try converting Expr(Unnest(Expr)) to Projection/Unnest/Projection
